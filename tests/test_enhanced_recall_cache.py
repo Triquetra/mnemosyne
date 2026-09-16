@@ -76,26 +76,80 @@ def _close_memory(memory: BeamMemory | None) -> None:
         memory.conn.close()
 
 
-def test_staged_fts_candidate_version_bump_invalidates_old_entries(
-    enhanced, monkeypatch, tmp_path: Path
+def test_unreadable_marker_bypasses_enhanced_cache_without_log_spam(
+    enhanced, monkeypatch, caplog
 ):
-    """#896 regression: staged FTS candidate membership/order changed.
+    memory, calls = enhanced
+    marker_reads = []
+    cache_calls = []
 
-    An opaque entry made under version 6 can contain the old candidate set, so
-    version 7 must produce a distinct digest and execute the updated pipeline.
-    The ``v2:`` key prefix remains fixed for QueryCache's opaque-key path.
+    class CacheSpy:
+        def get_opaque(self, key):
+            cache_calls.append(("get", key))
+
+        def put_opaque(self, key, results):
+            cache_calls.append(("put", key, results))
+
+        def close(self):
+            pass
+
+    memory._query_cache = CacheSpy()
+    conn_type = type(memory.conn)
+    real_execute = conn_type.execute
+
+    def execute_without_user_version(conn, sql, parameters=(), *args, **kwargs):
+        normalized = (
+            sql.strip().rstrip(";").casefold() if isinstance(sql, str) else ""
+        )
+        if normalized == "pragma user_version":
+            marker_reads.append(sql)
+            raise RuntimeError("marker header unreadable")
+        return real_execute(conn, sql, parameters, *args, **kwargs)
+
+    monkeypatch.setattr(conn_type, "execute", execute_without_user_version)
+    monkeypatch.setattr(beam_module, "_unknown_marker_warning_emitted", False)
+
+    with caplog.at_level(logging.DEBUG, logger="mnemosyne.core.beam"):
+        first = _call(memory, "unknown marker")
+        second = _call(memory, "unknown marker")
+
+    assert len(marker_reads) == 2
+    assert len(calls) == 2
+    assert first != second
+    assert cache_calls == []
+    marker_warnings = [
+        record for record in caplog.records
+        if record.levelno == logging.WARNING
+        and "vec store format marker unreadable" in record.getMessage()
+    ]
+    assert len(marker_warnings) == 1
+    assert not any(
+        record.levelno == logging.INFO
+        and "full-scan blob scoring this call" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("previous_version", [6, 7])
+def test_cache_version_bump_invalidates_staged_and_admission_entries(
+    enhanced, monkeypatch, tmp_path: Path, previous_version: int
+):
+    """Both prior cache generations miss under the admission algorithm.
+
+    Version 6 predates staged FTS candidate selection; version 7 is current
+    main before #911's admission/ranking change. The ``v2:`` key prefix stays
+    fixed for QueryCache's opaque-key path.
     """
     memory, calls = enhanced
-    assert memory._ENHANCED_RECALL_CACHE_VERSION == 7
+    assert memory._ENHANCED_RECALL_CACHE_VERSION == 8
 
-    # Warm the persistent cache under the old candidate-selection version.
     with monkeypatch.context() as ctx:
-        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", 6)
+        ctx.setattr(type(memory), "_ENHANCED_RECALL_CACHE_VERSION", previous_version)
         stale = _call(memory, "alpha query")
     assert len(calls) == 1
     stale_id = stale[0]["id"]
 
-    # The current-version digest differs from the stale v5 key: cache miss.
+    # The current-version digest differs from either stale key: cache miss.
     fresh = _call(memory, "alpha query")
     assert len(calls) == 2  # base recall ran; the stale entry was not reused
     assert not any(r.get("id") == stale_id for r in fresh)
